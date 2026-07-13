@@ -79,6 +79,40 @@
   .toast.err{background:var(--danger);}
 
   .progress-note{font-size:.8rem;color:var(--text-soft);text-align:center;margin:4px 0 10px;}
+
+  /* ---- Spracheingabe (Diktat) ---- */
+  .fieldwrap{position:relative;}
+  .fieldwrap textarea,.fieldwrap input[type=text]{padding-right:48px;}
+  .micbtn{position:absolute;top:6px;right:6px;width:36px;height:36px;border-radius:10px;
+    border:1.5px solid var(--teal);background:var(--teal-light);color:var(--teal-dark);
+    display:inline-flex;align-items:center;justify-content:center;padding:0;cursor:pointer;
+    transition:transform .1s,background .12s;z-index:2;}
+  .micbtn svg{width:19px;height:19px;display:block;}
+  .micbtn:active{transform:scale(.92);}
+  .micbtn.listening{background:var(--danger);border-color:var(--danger);color:#fff;
+    animation:micpulse 1.25s ease-in-out infinite;}
+  @keyframes micpulse{0%,100%{box-shadow:0 0 0 0 rgba(192,57,43,.5);}50%{box-shadow:0 0 0 7px rgba(192,57,43,0);}}
+  .mic-hint{font-size:.74rem;color:var(--text-soft);margin-top:5px;display:none;align-items:center;gap:6px;line-height:1.3;}
+  .mic-hint .dot{width:8px;height:8px;border-radius:50%;background:var(--danger);flex-shrink:0;animation:micpulse 1.25s ease-in-out infinite;}
+  .mic-hint .mic-live{color:var(--teal-dark);font-style:italic;}
+
+  /* ---- Info-/Hilfe-Kasten Spracheingabe ---- */
+  .card.help{border:1.5px solid var(--teal);}
+  .card.help h2{color:var(--teal-dark);}
+  .card.help h2 .tfnum{background:var(--teal);font-size:1rem;}
+  .help-lead{font-size:.9rem;color:var(--text);margin-bottom:12px;}
+  .help-steps{list-style:none;padding:0;margin:0;counter-reset:step;}
+  .help-steps li{position:relative;padding:0 0 12px 36px;font-size:.9rem;line-height:1.45;}
+  .help-steps li:last-child{padding-bottom:2px;}
+  .help-steps li:before{counter-increment:step;content:counter(step);position:absolute;left:0;top:-1px;
+    width:25px;height:25px;border-radius:8px;background:var(--teal);color:#fff;font-size:.82rem;font-weight:700;
+    display:flex;align-items:center;justify-content:center;}
+  .help-steps b{color:var(--navy);}
+  .help-tip{background:var(--teal-light);border-left:3px solid var(--teal);border-radius:8px;
+    padding:11px 13px;font-size:.87rem;line-height:1.5;margin-top:6px;}
+  .help-tip .tip-eg{display:block;margin-top:6px;color:var(--teal-dark);font-style:italic;}
+  .help-note{font-size:.78rem;color:var(--text-soft);margin-top:12px;line-height:1.45;}
+
   @media (prefers-reduced-motion: reduce){*{transition:none!important;}}
 </style>
 </head>
@@ -246,6 +280,72 @@ const SCHEMA = [
 const state = {};
 function ensure(gid){ if(!(gid in state)) state[gid]=null; return state[gid]; }
 
+/* ============ SPRACHEINGABE (Web Speech API) ============ */
+const MIC_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v1a7 7 0 0 1-14 0v-1"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="8" y1="22" x2="16" y2="22"/></svg>';
+
+const Speech = (function(){
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  const supported = !!SR;
+  let rec=null, activeBtn=null, wantListening=false;
+
+  function join(base, add){
+    add = add.replace(/^\s+/,"");
+    if(!add) return base;
+    if(!base) return add.charAt(0).toUpperCase()+add.slice(1);
+    const sep = /[\s\n([{"'„-]$/.test(base) ? "" : " ";
+    return base + sep + add;
+  }
+  function reset(btn, hint){
+    if(btn) btn.classList.remove("listening");
+    if(hint) hint.style.display="none";
+    activeBtn=null;
+  }
+  function stop(){
+    wantListening=false;
+    if(rec){ try{ rec.stop(); }catch(e){} }
+  }
+  function toggle(el, btn, hint){
+    // Läuft dieses Feld gerade? -> beenden
+    if(activeBtn===btn && wantListening){ stop(); return; }
+    // Anderes Feld war aktiv -> hart abbrechen
+    if(rec){ wantListening=false; try{ rec.abort(); }catch(e){} }
+
+    rec = new SR();
+    rec.lang="de-DE"; rec.continuous=true; rec.interimResults=true;
+    let finalText = el.value;
+    activeBtn = btn;
+
+    rec.onstart = ()=>{ btn.classList.add("listening"); if(hint){ hint.style.display="flex"; hint.querySelector(".mic-live").textContent="höre zu …"; } };
+    rec.onresult = (e)=>{
+      let interim="";
+      for(let i=e.resultIndex;i<e.results.length;i++){
+        const t=e.results[i][0].transcript;
+        if(e.results[i].isFinal) finalText = join(finalText, t);
+        else interim += t;
+      }
+      el.value = interim ? join(finalText, interim) : finalText;
+      el.dispatchEvent(new Event("input",{bubbles:true}));
+      if(hint) hint.querySelector(".mic-live").textContent = interim ? interim : "höre zu …";
+    };
+    rec.onerror = (e)=>{
+      if(e.error==="not-allowed"||e.error==="service-not-allowed"){
+        wantListening=false; showToast("Mikrofon-Zugriff nicht erlaubt.", true);
+      } else if(e.error==="aborted"||e.error==="no-speech"){ /* still, Neustart via onend */ }
+      else { showToast("Spracheingabe-Fehler: "+e.error, true); }
+    };
+    rec.onend = ()=>{
+      // Browser stoppt nach Sprechpausen automatisch -> neu starten solange aktiv
+      if(wantListening){ try{ rec.start(); }catch(e){} }
+      else { reset(btn, hint); }
+    };
+
+    wantListening = true;
+    try{ rec.start(); }
+    catch(e){ wantListening=false; reset(btn,hint); showToast("Spracheingabe konnte nicht gestartet werden.", true); }
+  }
+  return { supported, toggle, stop };
+})();
+
 /* ============ RENDER ============ */
 const app = document.getElementById("app");
 function build(){
@@ -312,10 +412,26 @@ function build(){
         if(g.type==="area"){ el=document.createElement("textarea"); }
         else{ el=document.createElement("input"); el.type = g.type==="num" ? "number" : (g.type==="date"?"date":"text"); }
         if(g.ph) el.placeholder=g.ph;
+        else if(g.type==="area") el.placeholder="Freitext – gern per 🎤 diktieren: individuelle Beobachtungen, Wünsche und konkreter Hilfebedarf der Person …";
         el.id="f_"+g.id;
         if(g.type==="date" && g.id==="datum"){ el.value = new Date().toISOString().slice(0,10); state[g.id]=el.value; }
         el.addEventListener("input",()=>{ state[g.id]= el.value.trim()||null; markCard(card, sec); });
-        grp.appendChild(el);
+
+        // Freitext-/Textfelder erhalten eine Spracheingabe (Diktat)
+        if((g.type==="area"||g.type==="text") && Speech.supported){
+          const wrap=document.createElement("div"); wrap.className="fieldwrap";
+          const btn=document.createElement("button"); btn.type="button"; btn.className="micbtn";
+          btn.setAttribute("aria-label","Spracheingabe für „"+(g.label||"Freitext")+"“");
+          btn.title="Diktieren (Sprache-zu-Text)";
+          btn.innerHTML=MIC_SVG;
+          const hint=document.createElement("div"); hint.className="mic-hint";
+          hint.innerHTML='<span class="dot"></span><span><span class="mic-live">höre zu …</span> · zum Beenden erneut auf das Mikrofon tippen</span>';
+          btn.addEventListener("click",()=>Speech.toggle(el, btn, hint));
+          wrap.appendChild(el); wrap.appendChild(btn);
+          grp.appendChild(wrap); grp.appendChild(hint);
+        } else {
+          grp.appendChild(el);
+        }
       }
       body.appendChild(grp);
     });
@@ -335,6 +451,30 @@ function markCard(card, sec){
   card.classList.toggle("hasdata", has);
 }
 build();
+
+/* ============ INFO-KASTEN SPRACHEINGABE ============ */
+function buildHelp(){
+  if(!Speech.supported) return;            // ohne Spracheingabe kein Hinweis nötig
+  const card=document.createElement("div");
+  card.className="card help";
+  card.id="card_help";
+  card.innerHTML =
+    '<h2><span class="tfnum">🎤</span><span>Spracheingabe – so geht\u2019s</span><span class="chev">\u25BC</span></h2>'+
+    '<div class="body">'+
+      '<div class="help-lead">Freitexte lassen sich diktieren statt tippen. Das Mikrofon-Symbol steht in der <b>Eingangsfrage</b>, in jedem <b>Themenfeld</b> (Bemerkungen) und in den <b>Detailfeldern</b>.</div>'+
+      '<ul class="help-steps">'+
+        '<li><b>Mikrofon antippen.</b> Es wird rot, darunter erscheint \u201eh\u00f6re zu \u2026\u201c. Jetzt einfach normal sprechen \u2013 der Text erscheint automatisch im Feld.</li>'+
+        '<li><b>Beenden:</b> Mikrofon erneut antippen. Nach Sprechpausen l\u00e4uft die Aufnahme von selbst weiter, bis Sie sie stoppen.</li>'+
+        '<li><b>Text wird angeh\u00e4ngt</b>, nicht \u00fcberschrieben. Sie k\u00f6nnen mehrmals diktieren und zwischendurch auch tippen und korrigieren.</li>'+
+      '</ul>'+
+      '<div class="help-tip"><b>Damit der Ma\u00dfnahmenplan individuell wird:</b> konkret sprechen \u2013 was kann die Person selbst, wobei genau braucht sie Hilfe, welche W\u00fcnsche, Gewohnheiten oder \u00c4ngste gibt es?'+
+        '<span class="tip-eg">Beispiel: \u201eM\u00f6chte morgens selbst duschen, braucht nur Hilfe beim R\u00fccken. Hat seit dem Sturz im Bad Angst, nachts allein aufzustehen.\u201c</span></div>'+
+      '<div class="help-note">Funktioniert in Chrome (Android) und Safari (iPhone/iPad). Beim ersten Mal fragt das Ger\u00e4t nach Mikrofon-Freigabe \u2013 bitte \u201eErlauben\u201c. Erscheint kein Mikrofon, unterst\u00fctzt der Browser die Funktion nicht; dann wie gewohnt tippen.</div>'+
+    '</div>';
+  card.querySelector("h2").addEventListener("click",()=>card.classList.toggle("open"));
+  app.insertBefore(card, app.firstChild);
+}
+buildHelp();
 
 /* ============ TOAST ============ */
 const toast=document.getElementById("toast");
@@ -367,6 +507,7 @@ function collectSummary(){
 
 /* ============ PDF ============ */
 async function makePdf(){
+  Speech.stop();
   const name=(state.name||"").trim();
   if(!name){ showToast("Bitte Klientennamen eintragen.", true); document.getElementById("f_name").focus(); document.getElementById("card_kopf").classList.add("open"); return; }
   const { jsPDF } = window.jspdf;
