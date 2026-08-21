@@ -596,5 +596,267 @@ document.getElementById("btnReset").addEventListener("click", ()=>{
   location.reload();
 });
 </script>
+<script>
+/* ============================================================
+   PDH-Autosave · Pflegedienst Herrlich · Version 1.1
+   Sichert Eingaben dauerhaft auf dem Geraet, damit sie einen
+   App-Wechsel, die Displaysperre oder einen Neustart ueberleben.
+   Gesichert werden Textfelder UND die Auswahl-Schaltflaechen.
+   Nach Versand/PDF aufrufen: PDHAutosave.clear();
+   ============================================================ */
+(function () {
+  'use strict';
+
+  /* ---- 1. Konfiguration ---------------------------------- */
+  var APP_ID  = 'sis-erhebung';   // pro App eindeutig!
+  var VERSION = 1;                // bei Formularumbau erhoehen
+
+  var CHIP_SEL  = 'button.chip';  // Auswahl-Schaltflaechen
+  var CHIP_ON   = 'on';           // CSS-Klasse fuer "ausgewaehlt"
+  var DEBOUNCE  = 400;            // ms Ruhe nach dem Tippen
+  var MAX_AGE_H = 72;             // Entwurf verfaellt nach 72 h
+  var KEY       = 'pdh:' + APP_ID + ':v' + VERSION;
+  var CI = { navy: '#211D5E', teal: '#048AAE', ok: '#1e7d4f',
+             card: '#ffffff', line: '#d9dee3', muted: '#6b7280' };
+
+  /* ---- 2. Speicher verfuegbar? --------------------------- */
+  var store = null;
+  try {
+    localStorage.setItem('pdh:test', '1');
+    localStorage.removeItem('pdh:test');
+    store = localStorage;
+  } catch (e) {
+    warnBanner('Achtung: Dieser Browser speichert keine Entwuerfe ' +
+               '(privater Modus?). Bitte das Formular in einem Zug ausfuellen.');
+    return;
+  }
+
+  /* ---- 3. Felder und Chips einsammeln -------------------- */
+  function fields() {
+    var out = [], all = document.querySelectorAll('input, select, textarea');
+    for (var i = 0; i < all.length; i++) {
+      var el = all[i];
+      if (el.type === 'password' || el.type === 'file' ||
+          el.type === 'submit'   || el.type === 'button' ||
+          el.hasAttribute('data-no-save')) continue;
+      out.push(el);
+    }
+    return out;
+  }
+
+  function chips() {
+    return Array.prototype.slice.call(document.querySelectorAll(CHIP_SEL));
+  }
+
+  function keyOf(el, idx) {
+    if (el.type === 'radio' && el.name) return 'r:' + el.name;
+    if (el.id)   return 'i:' + el.id;
+    if (el.name) return 'n:' + el.name + ':' + idx;
+    return 'p:' + el.tagName + ':' + (el.type || '') + ':' + idx;
+  }
+
+  /* ---- 4. Lesen / Schreiben ------------------------------ */
+  function collect() {
+    var data = {};
+    fields().forEach(function (el, i) {
+      var k = keyOf(el, i);
+      if (el.type === 'radio') {
+        if (!(k in data)) data[k] = '';
+        if (el.checked) data[k] = el.value;
+      } else if (el.type === 'checkbox') {
+        data[k] = !!el.checked;
+      } else {
+        data[k] = el.value;
+      }
+    });
+    data.__chips = chips().map(function (b) {
+      return b.classList.contains(CHIP_ON) ? 1 : 0;
+    });
+    return data;
+  }
+
+  function apply(data) {
+    fields().forEach(function (el, i) {
+      var k = keyOf(el, i);
+      if (!(k in data)) return;
+      if (el.type === 'radio')         el.checked = (data[k] === el.value);
+      else if (el.type === 'checkbox') el.checked = !!data[k];
+      else el.value = data[k];
+      el.dispatchEvent(new Event('input',  { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    // Chips per echtem Klick wiederherstellen, damit die App-eigene
+    // Logik (Kartenmarkierung, Zusammenfassung) korrekt mitlaeuft.
+    var saved = data.__chips, now = chips();
+    if (saved && saved.length === now.length) {
+      now.forEach(function (b, i) {
+        var soll = !!saved[i], ist = b.classList.contains(CHIP_ON);
+        if (soll !== ist) b.click();
+      });
+    } else if (saved && saved.length) {
+      warnBanner('Hinweis: Die Auswahl-Schaltflaechen konnten nicht ' +
+                 'wiederhergestellt werden, weil das Formular seit dem ' +
+                 'Speichern geaendert wurde. Bitte diese noch einmal durchgehen.');
+    }
+  }
+
+  function hasContent(data) {
+    for (var k in data) {
+      if (k === '__chips') continue;
+      var v = data[k];
+      if (v === true) return true;
+      if (typeof v === 'string' && v.trim() !== '') return true;
+    }
+    return (data.__chips || []).indexOf(1) !== -1;
+  }
+
+  var lastJSON  = '';
+  var suspended = false;
+
+  function save(reason) {
+    if (suspended) return;
+    var data = collect();
+    if (!hasContent(data)) return;
+    var json = JSON.stringify(data);
+    if (json === lastJSON && reason !== 'force') return;
+    lastJSON = json;
+    try {
+      store.setItem(KEY, JSON.stringify({ t: Date.now(), d: data }));
+      stamp();
+    } catch (e) {
+      warnBanner('Der Geraetespeicher ist voll - der Entwurf konnte nicht ' +
+                 'gesichert werden. Bitte jetzt abschliessen und versenden.');
+    }
+  }
+
+  function load() {
+    try {
+      var raw = store.getItem(KEY);
+      if (!raw) return null;
+      var obj = JSON.parse(raw);
+      if (!obj || !obj.d) return null;
+      if (Date.now() - obj.t > MAX_AGE_H * 3600e3) { store.removeItem(KEY); return null; }
+      return obj;
+    } catch (e) { return null; }
+  }
+
+  /* ---- 5. Ausloeser -------------------------------------- */
+  var timer = null;
+  function schedule() {
+    suspended = false;
+    clearTimeout(timer);
+    timer = setTimeout(save, DEBOUNCE);
+  }
+
+  document.addEventListener('input',  schedule, true);
+  document.addEventListener('change', schedule, true);
+
+  document.addEventListener('click', function (ev) {
+    var t = ev.target;
+    if (!t || !t.closest) return;
+    if (t.closest('[data-clears-draft]')) {
+      suspended = true; clearTimeout(timer);
+      setTimeout(function () { PDHAutosave.clear(); }, 1200);
+      return;
+    }
+    if (t.closest(CHIP_SEL)) schedule();
+  }, true);
+
+  // Entscheidend: App-Wechsel, Displaysperre, Tab-Wechsel.
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'hidden') { clearTimeout(timer); save('force'); }
+  });
+  window.addEventListener('pagehide', function () { clearTimeout(timer); save('force'); });
+  window.addEventListener('blur',     function () { save('force'); });
+
+  /* ---- 6. Statusanzeige ---------------------------------- */
+  var chip = null;
+  function stamp() {
+    if (!chip) {
+      chip = document.createElement('div');
+      chip.setAttribute('role', 'status');
+      chip.setAttribute('aria-live', 'polite');
+      chip.style.cssText = 'position:fixed;right:10px;bottom:10px;z-index:9998;' +
+        'background:' + CI.card + ';border:1px solid ' + CI.line + ';border-radius:8px;' +
+        'padding:6px 10px;font:12px Arial,Helvetica,sans-serif;color:' + CI.ok + ';' +
+        'box-shadow:0 2px 6px rgba(0,0,0,.12);pointer-events:none;';
+      document.body.appendChild(chip);
+    }
+    var d = new Date();
+    chip.textContent = '✓ Gespeichert ' +
+      ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2);
+  }
+
+  function warnBanner(text) {
+    var b = document.createElement('div');
+    b.setAttribute('role', 'alert');
+    b.style.cssText = 'position:sticky;top:0;z-index:9999;background:#fff4f4;' +
+      'border-bottom:2px solid #dc3545;color:#8a1220;padding:10px 14px;' +
+      'font:14px Arial,Helvetica,sans-serif;';
+    b.textContent = text;
+    (document.body || document.documentElement).prepend(b);
+  }
+
+  /* ---- 7. Wiederherstellen beim Oeffnen ------------------ */
+  function offerRestore() {
+    var obj = load();
+    if (!obj || !hasContent(obj.d)) return;
+
+    var when = new Date(obj.t);
+    var box = document.createElement('div');
+    box.setAttribute('role', 'alertdialog');
+    box.setAttribute('aria-label', 'Gespeicherten Entwurf wiederherstellen');
+    box.style.cssText = 'position:sticky;top:0;z-index:9999;background:' + CI.card + ';' +
+      'border-bottom:3px solid ' + CI.teal + ';padding:12px 14px;' +
+      'font:15px Arial,Helvetica,sans-serif;color:' + CI.navy + ';' +
+      'display:flex;flex-wrap:wrap;gap:10px;align-items:center;' +
+      'box-shadow:0 2px 8px rgba(0,0,0,.10);';
+
+    var txt = document.createElement('span');
+    txt.style.cssText = 'flex:1 1 220px;line-height:1.4;';
+    txt.innerHTML = '<strong>Nicht abgeschlossener Entwurf gefunden<\/strong><br>' +
+      '<span style="color:' + CI.muted + '">vom ' +
+      when.toLocaleDateString('de-DE') + ', ' +
+      when.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' }) +
+      ' Uhr<\/span>';
+
+    var btnYes = document.createElement('button');
+    btnYes.type = 'button';
+    btnYes.textContent = 'Weiterarbeiten';
+    btnYes.style.cssText = 'min-height:44px;padding:0 18px;border:0;border-radius:8px;' +
+      'background:' + CI.navy + ';color:#fff;font:bold 15px Arial,Helvetica,sans-serif;cursor:pointer;';
+
+    var btnNo = document.createElement('button');
+    btnNo.type = 'button';
+    btnNo.textContent = 'Neu beginnen';
+    btnNo.style.cssText = 'min-height:44px;padding:0 18px;border:1px solid ' + CI.line + ';' +
+      'border-radius:8px;background:#fff;color:' + CI.navy + ';' +
+      'font:15px Arial,Helvetica,sans-serif;cursor:pointer;';
+
+    btnYes.onclick = function () { apply(obj.d); box.remove(); stamp(); };
+    btnNo.onclick  = function () {
+      if (confirm('Entwurf vom ' + when.toLocaleString('de-DE') +
+                  ' endgueltig verwerfen?')) { PDHAutosave.clear(); box.remove(); }
+    };
+
+    box.appendChild(txt); box.appendChild(btnNo); box.appendChild(btnYes);
+    document.body.prepend(box);
+    btnYes.focus();
+  }
+
+  /* ---- 8. Oeffentliche Schnittstelle --------------------- */
+  window.PDHAutosave = {
+    save:  function () { save('force'); },
+    clear: function () { suspended = true; clearTimeout(timer);
+                         try { store.removeItem(KEY); } catch (e) {}
+                         lastJSON = ''; if (chip) chip.textContent = ''; },
+    read:  function () { var o = load(); return o ? o.d : null; },
+    appId: APP_ID
+  };
+
+  // Start erst, wenn die App ihr Formular aufgebaut hat.
+  window.addEventListener('load', function () { setTimeout(offerRestore, 300); });
+})();
+</script>
 </body>
 </html>
